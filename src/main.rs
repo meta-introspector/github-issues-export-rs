@@ -4,15 +4,11 @@ use std::str::FromStr;
 use std::{fmt, io};
 
 use anyhow::{anyhow, bail};
-use argh::FromArgs;
+use clap::Parser;
 use futures::StreamExt;
 use handlebars::Handlebars;
 use headers::{authorization::Bearer, Authorization, ContentType, HeaderMapExt, UserAgent};
-use hyper::{
-    client::{Client, HttpConnector},
-    Body, Request,
-};
-use hyper_tls::HttpsConnector;
+use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use tracing::{debug, info};
 
@@ -21,7 +17,7 @@ mod template;
 
 #[derive(Clone)]
 struct Github {
-    client: Client<HttpsConnector<HttpConnector>>,
+    client: reqwest::Client,
     user_agent: UserAgent,
     auth: Authorization<Bearer>,
 }
@@ -35,8 +31,7 @@ impl Github {
             "/",
             env!("CARGO_PKG_VERSION")
         ));
-        let https = HttpsConnector::new();
-        let client = hyper::Client::builder().build(https);
+        let client = reqwest::Client::new();
         Ok(Self {
             client,
             user_agent,
@@ -46,26 +41,18 @@ impl Github {
 
     async fn get<T>(&self, endpoint: &str) -> anyhow::Result<T>
     where
-        T: serde::de::DeserializeOwned,
+        T: DeserializeOwned,
     {
-        let mut req = Request::get(endpoint);
-        if let Some(headers) = req.headers_mut() {
-            headers.typed_insert(self.user_agent.clone());
-            headers.typed_insert(self.auth.clone());
-            headers.typed_insert(ContentType::json());
-        }
-        let req = req.body(Body::empty())?;
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.typed_insert(self.user_agent.clone());
+        headers.typed_insert(self.auth.clone());
+        headers.typed_insert(ContentType::json());
+
+        let req = self.client.get(endpoint).headers(headers).build()?;
 
         debug!(?req, "request");
-        let resp = self.client.request(req).await?;
-        let status = resp.status();
-        let body_bytes = hyper::body::to_bytes(resp.into_body()).await?;
-
-        if status.is_success() {
-            Ok(serde_json::from_slice(&body_bytes)?)
-        } else {
-            bail!("request failed: {}", String::from_utf8_lossy(&body_bytes));
-        }
+        let resp = self.client.execute(req).await?.error_for_status()?;
+        Ok(resp.json().await?)
     }
 
     async fn issue(
@@ -129,8 +116,9 @@ fn serialize(
     Ok(())
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize, Clone, Copy)]
 enum State {
+    #[default]
     Open,
     Closed,
     All,
@@ -160,22 +148,22 @@ impl fmt::Display for State {
 }
 
 /// Export issues from GitHub into markdown files.
-///
-/// Requires environment variable GITHUB_TOKEN (in environment or .env file)
-#[derive(Debug, FromArgs)]
+#[derive(Debug, Parser)]
 struct Args {
-    /// output directory [default: ./md]
-    #[argh(option, short = 'p', default = "PathBuf::from(\"./md\")")]
+    /// output directory
+    #[arg(long, short, default_value = "\"./md\"")]
     path: PathBuf,
-    /// fetch issues that are open, closed, or both [default: open]
-    #[argh(option, short = 's', default = "State::Open")]
+    /// fetch issues that are open, closed, or both
+    #[arg(long, short, default_value_t)]
     state: State,
     /// query of the form: username/repo[#issue_number]
-    #[argh(positional)]
     query: Query,
+    /// GitHub access token
+    #[arg(long, env)]
+    github_token: String,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Query {
     username: String,
     repo: String,
@@ -212,7 +200,7 @@ const MAX_PARALLEL_FETCHES: usize = 8;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = init();
-    let token = dotenv::var("GITHUB_TOKEN")
+    let token = dotenvy::var("GITHUB_TOKEN")
         .map_err(|_| anyhow!("missing obligatory environment variable GITHUB_TOKEN"))?;
 
     let auth = Authorization::bearer(&token)?;
@@ -247,12 +235,12 @@ async fn main() -> anyhow::Result<()> {
 }
 
 fn init() -> Args {
-    if std::env::var("RUST_LOG").is_err() {
-        std::env::set_var("RUST_LOG", "info")
-    }
+    let filter = tracing_subscriber::EnvFilter::builder()
+        .with_default_directive(tracing::metadata::LevelFilter::INFO.into())
+        .from_env_lossy();
     tracing_subscriber::fmt::fmt()
         .with_writer(std::io::stderr)
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_env_filter(filter)
         .init();
-    argh::from_env()
+    Args::parse()
 }
