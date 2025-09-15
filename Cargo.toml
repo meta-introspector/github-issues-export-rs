@@ -1,3 +1,4 @@
+[workspace]
 [package]
 name = "github-issues-export"
 version = "0.1.5"
